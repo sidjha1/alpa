@@ -18,7 +18,10 @@ SPMD_PARTITIONED
   V
 FULLY_OPTIMIZED
 """
+from collections import defaultdict
 import dataclasses
+import gurobipy as gp
+from gurobipy import GRB, quicksum
 import logging
 import multiprocessing
 import os
@@ -43,6 +46,8 @@ logger.setLevel(logging.INFO)
 
 # A constant to represent infinity
 INFINITY_COST = 1e13
+MB = 2**20
+GB = 2**30
 
 
 @dataclasses.dataclass
@@ -70,7 +75,7 @@ class AutoShardingOption:
     # Allow mixed 1d mesh and 2d mesh shape.
     allow_mixed_mesh_shape: bool = False
     # Allow replicated dot computation.
-    allow_recompute_heavy_op: bool = False
+    allow_recompute_heavy_op: bool = True
     # If it is not empty, forcibly use a simple heuristic instead of the ILP
     # solver.
     force_simple_heuristic: str = ""
@@ -332,7 +337,7 @@ def run_auto_sharding_pass(
 
             # Debug options
             "auto_sharding::simplify_graph":
-                True,
+                False,
             "auto_sharding::print_strategy":
                 os.environ.get("ALPA_DEBUG_PRINT_AS_STRATEGY", "False").lower()
                 in ["true", "1"],
@@ -593,6 +598,8 @@ def call_solver_serialized_args(*args):
     info = ""
     try:
         ret = _call_solver_serialized_args(*args)
+        # ret = _call_solver_kiwi(*args)
+        # ret = _call_solver_optimal(*args)
     except AssertionError:
         ret = None
         info = str(traceback.format_exc()[:-1])
@@ -626,6 +633,8 @@ def _call_solver_serialized_args(N,
                                  m_np,
                                  r_np,
                                  v_np,
+                                 elementwise_np,
+                                 param_np,
                                  s_init_np=None):
     """Call the solver with serialized arguments."""
     # pylint: disable=invalid-name
@@ -706,6 +715,38 @@ def _call_solver_serialized_args(N,
     assert pt == len(c_np), f"{pt} == {len(c_np)}"
     assert pt == len(d_np), f"{pt} == {len(d_np)}"
     assert pt == len(m_np), f"{pt} == {len(m_np)}"
+
+    def get_parent(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i:
+                ps.append(src)
+        return ps
+
+    def liveness_analysis(end):
+        liveness_dict = dict()
+        live_set = set()
+
+        for t in range(end - 1, -1, -1):
+            live_set.add(t)
+            for operand in get_parent(t):
+                live_set.add(operand)
+
+            liveness_dict[t] = set(live_set)
+            live_set.remove(t)
+
+        for t in (liveness_dict):
+            for param in param_np:
+                liveness_dict[t].add(param)
+
+        return liveness_dict
+
+    L = liveness_analysis(N)
+    M = 100 * GB
+    print(f"Given memory: {M / GB} GB")
+    print(f"Number of edges: {len(E)}")
+    print(f"Number of nodes: {N}")
+    print(f"Alias set size: {len(A)}")
 
     # 1. Create variables
     s = []
@@ -869,7 +910,749 @@ def _call_solver_serialized_args(N,
     if objective > INFINITY_COST:
         warnings.warn("Detect unexpected behaviors in the auto-sharding pass.")
 
-    return s_val, e_val, objective, status
+    peak_mem = 0
+    peak_t = 0
+    for t in range(N):
+        mem = 0
+        for i in L[t]:
+            mem += m[i][s_val[i]]
+        if mem >= peak_mem:
+            peak_mem = mem
+            peak_t = t
+
+    print("====================================")
+    print(f"Objective: {objective}")
+    print(f"Peak memory: {peak_mem / GB} GB")
+    print(f"Peak time: {peak_t}")
+    print("====================================")
+
+    return None
+
+
+def _call_solver_kiwi(N,
+                      M,
+                      s_len_np,
+                      s_follow_np,
+                      E_np,
+                      A_np,
+                      L_np,
+                      c_np,
+                      d_np,
+                      m_np,
+                      r_np,
+                      v_np,
+                      elementwise_np,
+                      param_np,
+                      s_init_np=None):
+    global last_s_val, last_objective
+
+    for x in [s_len_np, E_np, A_np, L_np, c_np, d_np, m_np, r_np, v_np]:
+        assert isinstance(x, np.ndarray)
+    assert len(s_len_np) == N, "s_len_np"
+
+    # 0. Unpack flatten numpy arrays
+    s_len = s_len_np
+    s_follow = s_follow_np
+    E = E_np.reshape((-1, 2))  # noqa
+    r = []
+    pt = 0
+    edge_set = set()
+    for (i, j) in E:
+        prod_length = s_len[i] * s_len[j]
+
+        if (i, j) in edge_set:
+            raise ValueError(f"Duplicated edges: {(i, j)}")
+
+        edge_set.add((i, j))
+        r.append(r_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(r_np)
+
+    A = A_np.reshape((-1, 2))  # noqa
+    v = []
+    pt = 0
+    for (i, j) in A:
+        prod_length = s_len[i] * s_len[j]
+        v.append(v_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(v_np)
+
+    L = []  # noqa
+    pt = N
+    for i in range(N):
+        length = L_np[i]
+        L.append(L_np[pt:pt + length])
+        pt += length
+    assert pt == len(L_np)
+
+    c = []
+    d = []
+    m = []
+    pt = 0
+    for i in range(N):
+        length = s_len[i]
+        c.append(c_np[pt:pt + length])
+        d.append(d_np[pt:pt + length])
+        m.append(m_np[pt:pt + length])
+        pt += length
+    assert pt == len(c_np), f"{pt} == {len(c_np)}"
+    assert pt == len(d_np), f"{pt} == {len(d_np)}"
+    assert pt == len(m_np), f"{pt} == {len(m_np)}"
+
+    M = 100 * GB
+    print(f"Given memory: {M / GB} GB")
+    print(f"Number of edges: {len(E)}")
+    print(f"Number of nodes: {N}")
+    print(f"Alias set size: {len(A)}")
+
+    def get_parent(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i:
+                ps.append(src)
+        return ps
+
+    def get_parent_non_param(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i and i not in param_np:
+                ps.append(src)
+        return ps
+
+    def get_child(i):
+        ps = []
+        for (src, dst) in E:
+            if src == i:
+                ps.append(dst)
+        return ps
+
+    def get_child_forward(i, sep_id):
+        ps = []
+        for (src, dst) in E:
+            if src == i and dst < sep_id:
+                ps.append(dst)
+        return ps
+
+    def get_edge_idx(src, dst):
+        for idx, (i, j) in enumerate(E):
+            if i == src and j == dst:
+                return idx
+        assert False
+
+    def get_non_zero_index(bv):
+        for j, ele in enumerate(bv):
+            if abs(ele - 1) < 0.001:
+                return j
+        assert False
+
+    def liveness_analysis(sep_id):
+        liveness_dict = dict()
+        live_set = set()
+
+        for t in range(sep_id, -1, -1):
+            live_set.add(t)
+            for operand in get_parent(t):
+                live_set.add(operand)
+
+            liveness_dict[t] = set(live_set)
+            live_set.remove(t)
+
+        for t in (liveness_dict):
+            for param in param_np:
+                liveness_dict[t].add(param)
+
+        return liveness_dict
+
+    def getL(forward_liveness):
+        L = defaultdict(list)
+        first_liveness = []
+        all_liveness = set([])
+        for t in sorted(forward_liveness.keys()):
+            not_live = set(all_liveness) - set(forward_liveness[t])
+            for ins in not_live:
+                if ins not in first_liveness:
+                    L[t].append(ins)
+                    first_liveness.append(ins)
+            all_liveness = all_liveness.union(forward_liveness[t])
+        return L
+
+    def getX(sep_id):
+        X = defaultdict(list)
+        used_by = []
+        for ins in range(sep_id + 1, N):
+            for operand in get_parent(ins):
+                if operand >= sep_id:
+                    continue
+                if operand not in used_by:
+                    X[ins].append(operand)
+                    used_by.append(operand)
+        return X
+
+    def getY(sep_id):
+        Y = {}
+        used_by = defaultdict(list)
+        for ins in range(N):
+            for operand in get_parent(ins):
+                used_by[operand].append(ins)
+            used_by[ins].append(ins)
+
+        for ins in list(used_by):
+            if ins >= sep_id:
+                continue
+            all_uses = (used_by[ins]).copy()
+            for child in list(used_by[ins]):
+                if child >= sep_id:
+                    continue
+                all_uses = set(list(all_uses) + used_by[child].copy())
+            Y[ins] = max([use for use in all_uses])
+
+        for ins in list(used_by):
+            if ins < sep_id:
+                continue
+            all_uses = (used_by[ins]).copy()
+            Y[ins] = max([use for use in all_uses])
+
+        return Y
+
+    def getH(sep_id):
+        H = {}
+        for ins in range(sep_id, N):
+            for operand in get_parent(ins):
+                if operand not in H:
+                    H[operand] = i
+
+        for ins in range(sep_id):
+            if ins not in H:
+                H[ins] = 0
+
+        return H
+
+    def get_sep_id():
+        used_by = defaultdict(list)
+        for ins in range(N):
+            for operand in get_parent(ins):
+                used_by[operand].append(ins)
+
+        sep_id = 0
+        for param in param_np:
+            if len(used_by[param]) > 2:
+                backward_id = used_by[param][0]
+                sep_id = max(sep_id, backward_id + 1)
+        return sep_id
+
+    sep_id = get_sep_id()
+    print(f"sep_id: {sep_id}")
+
+    model = gp.Model("kiwi")
+    model.Params.TimeLimit = 1000
+
+    m_c = model.addVars(1, N, name="m", vtype=gp.GRB.BINARY)
+    U = model.addVars(1, N, name="U", lb=0, ub=M)
+    S = []
+
+    for i in range(N):
+        if s_len[i] == 1:
+            cur_s = np.array([1])
+        else:
+            cur_s = model.addMVar(s_len[i], vtype=GRB.BINARY, name=f'S[{i}]')
+        S.append(cur_s)
+
+    E_c = []
+    for (i, j) in E:
+        if s_len[i] == 1:
+            E_c.append(S[j])
+        elif s_len[j] == 1:
+            E_c.append(S[i])
+        else:
+            E_c.append(
+                model.addMVar(s_len[i] * s_len[j],
+                              vtype=GRB.BINARY,
+                              name=f'E[{i}][{j}]'))
+
+    for i in param_np:
+        model.addConstr(m_c[0, i], GRB.EQUAL, 1)
+
+    used_by = defaultdict(list)
+    for i in range(sep_id, N):
+        for operand in get_parent(i):
+            used_by[operand].append(i)
+
+    Z = [0] * N
+    for i in range(sep_id):
+        if len(used_by[i]) > 0:
+            Z[i] = 1
+
+    objective = 0
+    for i in range(N):
+        cur_obj = (S[i] @ c[i]).item() + (S[i] @ d[i]).item()
+        for v in get_parent(i):
+            cur_obj += (E_c[get_edge_idx(v, i)] @ r[get_edge_idx(v, i)]).item()
+        objective += cur_obj * (1 + (1 - m_c[0, i]) * Z[i])
+    model.setObjective(objective, GRB.MINIMIZE)
+
+    for i in range(sep_id):
+        parents = get_parent(i)
+        model.addConstr(
+            INFINITY_COST * m_c[0, i] + quicksum([m_c[0, p] for p in parents]),
+            GRB.GREATER_EQUAL, len(parents))
+
+    X = getX(sep_id)
+    Y = getY(sep_id)
+    H = getH(sep_id)
+
+    h = []
+    h_z = []
+    for i in range(sep_id):
+        h.append(model.addVar(lb=0, ub=N, vtype=GRB.INTEGER))
+
+        cur = [model.addVar(vtype=GRB.BINARY)]
+        for j in get_child_forward(i, sep_id):
+            cur.append(model.addVar(vtype=GRB.BINARY))
+        h_z.append(cur)
+
+    for i in range(sep_id):
+        model.addConstr(quicksum([h_z[i][j] for j in range(len(h_z[i]))]),
+                        GRB.EQUAL, 1)
+
+        if len(get_child(i)) == 0:
+            # print("Node ", i, " has no child")
+            model.addConstr(h[i], GRB.EQUAL, i)
+        else:
+            model.addConstr(h[i], GRB.LESS_EQUAL,
+                            max(get_child(i)) + (N * (1 - h_z[i][0])))
+            model.addConstr(h[i], GRB.GREATER_EQUAL, max(get_child(i)))
+
+        for (idx, child) in enumerate(get_child_forward(i, sep_id)):
+            model.addConstr(h[i], GRB.LESS_EQUAL,
+                            (1 - m_c[0, child]) * H[child] +
+                            (N * (1 - h_z[i][idx + 1])))
+            model.addConstr(h[i], GRB.GREATER_EQUAL,
+                            (1 - m_c[0, child]) * H[child])
+
+    FREE = model.addVars(sep_id, N, name="FREE", lb=0, ub=1, vtype=GRB.BINARY)
+    FREE_PLUS = model.addVars(sep_id,
+                              N,
+                              name="FREE_PLUS",
+                              lb=0,
+                              ub=1,
+                              vtype=GRB.BINARY)
+    FREE_MINUS = model.addVars(sep_id,
+                               N,
+                               name="FREE_MINUS",
+                               lb=0,
+                               ub=1,
+                               vtype=GRB.BINARY)
+    delta = 0.001
+
+    for i in range(sep_id):
+        for j in range(N):
+            model.addConstr(h[i], GRB.LESS_EQUAL,
+                            (j - delta) * FREE_MINUS[i, j] + j * FREE[i, j] +
+                            N * FREE_PLUS[i, j])
+            model.addConstr(h[i], GRB.GREATER_EQUAL,
+                            (j + delta) * FREE_PLUS[i, j] + j * FREE[i, j])
+            model.addConstr(FREE[i, j] + FREE_PLUS[i, j] + FREE_MINUS[i, j],
+                            GRB.EQUAL, 1)
+
+    forward_liveness = liveness_analysis(sep_id)
+    L = getL(forward_liveness)
+    U[0, 0] = (m[0] @ S[0]).item()
+
+    for i in range(sep_id):
+        mem_freed = 0
+        for j in range(sep_id):
+            if j not in param_np:
+                mem_freed += FREE[j, i] * (S[j] @ m[j]).item()
+
+        mem_freed += quicksum(
+            [Z[j] * (1 - m_c[0, j]) * (S[j] @ m[j]).item() for j in L[i + 1]])
+        model.addConstr(U[0, i + 1], GRB.EQUAL,
+                        U[0, i] + (S[i + 1] @ m[i + 1]).item() - mem_freed)
+
+    for i in range(sep_id, N - 1):
+        mem_added = quicksum([
+            (1 - m_c[0, j]) * (S[j] @ m[j]).item() for j in X[i + 1]
+        ])
+        mem_freed = 0
+        for j in range(N):
+            if j < sep_id and j not in param_np:
+                mem_freed += FREE[j, i] * (S[j] @ m[j]).item()
+            if Y[j] == i and j not in param_np:
+                if j >= sep_id:
+                    mem_freed += (S[j] @ m[j]).item()
+
+        model.addConstr(
+            U[0, i + 1], GRB.EQUAL,
+            U[0, i] + (S[i + 1] @ m[i + 1]).item() + mem_added - mem_freed)
+
+    for i in range(sep_id, N):
+        model.addConstr(m_c[0, i], GRB.EQUAL, 1)
+
+    for i in range(N):
+        if s_len[i] > 1:
+            model.addConstr(quicksum(S[i]).item(), GRB.EQUAL, 1)
+
+    for idx in range(len(E_c)):
+        if not isinstance(E_c[idx], np.ndarray):
+            model.addConstr(quicksum(E_c[idx]).item(), GRB.EQUAL, 1)
+
+    for idx, (i, j) in enumerate(E):
+        if s_len[i] > 1:
+            for row in range(s_len[i]):
+                C = s_len[j]
+                model.addConstr(
+                    quicksum([E_c[idx][row * C + col]
+                              for col in range(C)]) <= S[i][row])
+        if s_len[j] > 1:
+            for col in range(s_len[j]):
+                R = s_len[i]
+                C = s_len[j]
+                model.addConstr(
+                    quicksum([E_c[idx][row * C + col]
+                              for row in range(R)]) <= S[j][col])
+
+    alias_set = set()
+    for (idx, (i, j)) in enumerate(A):
+        R = s_len[i]  # noqa
+        C = s_len[j]  # noqa
+        if (i, j) in alias_set:
+            raise ValueError(f"Duplicated edges: {(i, j)}")
+
+        alias_set.add((i, j))
+        alias_set.add((j, i))
+
+        for row in range(s_len[i]):
+            for col in range(s_len[j]):
+                if v[idx][row * C + col] > 0.5:
+                    prob += S[i][row] + S[j][col] <= 1
+
+    # Force no recompute
+    # if True:
+    #     for i in range(N):
+    #         model.addConstr(m_c[0, i], GRB.EQUAL, 1)
+
+    model.optimize()
+
+    peak_mem = 0
+    for k in range(N):
+        cur_mem = model.getVarByName(f'U[0,{k}]').X
+        if cur_mem > peak_mem:
+            peak_mem = cur_mem
+            peak_t = (k)
+
+    print("====================================")
+    print(f"Objective: {model.ObjVal}")
+    print(f"Peak memory: {peak_mem / GB} GB")
+    print(f"Peak time: {peak_t}")
+    print("====================================")
+
+    recomputed = []
+    for i in range(N):
+        if Z[i] * (1 - m_c[0, i].X) == 1:
+            recomputed.append(i)
+
+    print(f"Recomputed: {recomputed}")
+    return None
+
+
+def _call_solver_optimal(N,
+                         M,
+                         s_len_np,
+                         s_follow_np,
+                         E_np,
+                         A_np,
+                         L_np,
+                         c_np,
+                         d_np,
+                         m_np,
+                         r_np,
+                         v_np,
+                         elementwise_np,
+                         param_np,
+                         s_init_np=None):
+    global last_s_val, last_objective
+
+    for x in [s_len_np, E_np, A_np, L_np, c_np, d_np, m_np, r_np, v_np]:
+        assert isinstance(x, np.ndarray)
+    assert len(s_len_np) == N, "s_len_np"
+
+    # 0. Unpack flatten numpy arrays
+    s_len = s_len_np
+    s_follow = s_follow_np
+    E = E_np.reshape((-1, 2))  # noqa
+    r = []
+    pt = 0
+    edge_set = set()
+    for (i, j) in E:
+        prod_length = s_len[i] * s_len[j]
+
+        if (i, j) in edge_set:
+            raise ValueError(f"Duplicated edges: {(i, j)}")
+
+        edge_set.add((i, j))
+        r.append(r_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(r_np)
+
+    A = A_np.reshape((-1, 2))  # noqa
+    v = []
+    pt = 0
+    for (i, j) in A:
+        prod_length = s_len[i] * s_len[j]
+        v.append(v_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(v_np)
+    assert A.size == 0
+
+    L = []  # noqa
+    pt = N
+    for i in range(N):
+        length = L_np[i]
+        L.append(L_np[pt:pt + length])
+        pt += length
+    assert pt == len(L_np)
+
+    c = []
+    d = []
+    m = []
+    pt = 0
+    for i in range(N):
+        length = s_len[i]
+        c.append(c_np[pt:pt + length])
+        d.append(d_np[pt:pt + length])
+        m.append(m_np[pt:pt + length])
+        pt += length
+    assert pt == len(c_np), f"{pt} == {len(c_np)}"
+    assert pt == len(d_np), f"{pt} == {len(d_np)}"
+    assert pt == len(m_np), f"{pt} == {len(m_np)}"
+
+    M = 100 * GB
+    print("PEAK MEM: ", M)
+
+    def get_parent(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i:
+                ps.append(src)
+        return ps
+
+    def get_parent_non_param(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i and i not in param_np:
+                ps.append(src)
+        return ps
+
+    def get_child(i):
+        ps = []
+        for (src, dst) in E:
+            if src == i:
+                ps.append(dst)
+        return ps
+
+    def get_child_forward(i, sep_id):
+        ps = []
+        for (src, dst) in E:
+            if src == i and dst < sep_id:
+                ps.append(dst)
+        return ps
+
+    def get_edge_idx(src, dst):
+        for idx, (i, j) in enumerate(E):
+            if i == src and j == dst:
+                return idx
+        assert False
+
+    def get_non_zero_index(bv):
+        for j, ele in enumerate(bv):
+            if abs(ele - 1) < 0.001:
+                return j
+        assert False
+
+    model = gp.Model("optimal")
+    model.Params.TimeLimit = 1000000
+    model.Params.Threads = 24
+
+    ##################################Create Variables##############################
+    # Create A (N, N), Create B (N, N), Create U (N, N)
+    # A[t][k] = (Re)compute node k in stage t
+    # B[t][k] = Keep node k in memory in stage t-1 until stage t
+    # U[t][k] = Memory used after computing node k in stage t
+    # FREE[t][i][k] = Free node i after computing node k in stage t
+    A = model.addVars(N, N, name="A", vtype=GRB.BINARY, lb=0.0, ub=1.0)
+    B = model.addVars(N, N, name="B", vtype=GRB.BINARY, lb=0.0, ub=1.0)
+    U = model.addVars(N, N, name="U", lb=0, ub=M)
+    FREE = model.addVars(N,
+                         len(E),
+                         name="FREE",
+                         vtype=GRB.BINARY,
+                         lb=0.0,
+                         ub=1.0)
+
+    S = []
+    for i in range(N):
+        if s_len[i] == 1:
+            cur_s = np.array([1])
+        else:
+            cur_s = model.addMVar(s_len[i], vtype=GRB.BINARY, name=f'S[{i}]')
+        S.append(cur_s)
+
+    E_c = []
+    for (i, j) in E:
+        if s_len[i] == 1:
+            E_c.append(S[j])
+        elif s_len[j] == 1:
+            E_c.append(S[i])
+        else:
+            E_c.append(
+                model.addMVar(s_len[i] * s_len[j],
+                              lb=0,
+                              ub=1,
+                              vtype=GRB.BINARY,
+                              name=f'E[{i}][{j}]'))
+
+    # Dealing with parameters (i)
+    # Compute parameter i in stage i and always keep it in memory
+    for i in param_np:
+        # model.addLConstr(quicksum([A[t, i] for t in range(start, N)]), GRB.EQUAL, 0)
+        for t in range(i + 1, N):
+            model.addLConstr(B[t, i], GRB.EQUAL, 1)
+
+    ##################################Objective########################################
+    model.setObjective(
+        quicksum(A[t, i] * ((S[i] @ c[i]).item() + (S[i] @ d[i]).item())
+                 for t in range(N)
+                 for i in range(t + 1)) +
+        quicksum(A[t, i] *
+                 (E_c[get_edge_idx(v, i)] @ r[get_edge_idx(v, i)]).item()
+                 for t in range(N) for i in range(t + 1)
+                 for v in get_parent(i)), GRB.MINIMIZE)
+
+    #################################Constraint#######################################
+    # (1) A[t][i], B[t][i], Free[t][i][k] are binaries
+    # (2) A[t][j] <= A[t][i] + B[t][i] for all t, (i, j) in E
+    for idx, (i, j) in enumerate(E):
+        for t in range(N):
+            model.addLConstr(A[t, j], GRB.LESS_EQUAL, A[t, i] + B[t, i])
+
+    # (3) B[t][i] <= A[t-1][i] + B[t-1][i] for t>=1 for all i
+    for i in range(N):
+        for t in range(1, N):
+            model.addLConstr(B[t, i], GRB.LESS_EQUAL, A[t - 1, i] + B[t - 1, i])
+
+    # (4) U[t][0] = M_input + sum(S[i] @ M[i] * B[t][i])
+    for t in range(N):
+        model.addConstr(
+            U[t, 0], GRB.EQUAL,
+            quicksum([(S[i] @ m[i]).item() * B[t, i] for i in range(N)]) +
+            A[t, 0] * (S[0] @ m[0]).item())
+
+    # (5) U[t][k+1] = U[t][k] - mem_freed(k) + A[t][k+1](S[k+1] @ M[k+1])
+    for t in range(N):
+        for k in range(N - 1):
+            mem_freed = quicksum([
+                (S[i] @ m[i]).item() * FREE[t, get_edge_idx(i, k)]
+                for i in get_parent_non_param(k)
+            ])
+
+            mem_added = A[t, k + 1] * (S[k + 1] @ m[k + 1]).item()
+            model.addConstr(U[t, k + 1], GRB.EQUAL,
+                            U[t, k] - mem_freed + mem_added)
+
+    # (6) FREE constraints
+    def _num_hazard(t, i, k):
+        if t < N - 1:
+            return 1 - A[t, k] + B[t + 1, i] + quicksum(
+                A[t, j] for j in get_child(i) if j > k)
+        return 1 - A[t, k] + quicksum(A[t, j] for j in get_child(i) if j > k)
+
+    def _num_hazard_max(t, i, k):
+        if t < N - 1:
+            return 2 + sum([1 for j in get_child(i) if j > k])
+        return 1 + sum([1 for j in get_child(i) if j > k])
+
+    for t in range(N):
+        for (i, k) in E:
+            model.addConstr(1 - FREE[t, get_edge_idx(i, k)], GRB.LESS_EQUAL,
+                            _num_hazard(t, i, k))
+            model.addConstr(
+                _num_hazard(t, i, k), GRB.LESS_EQUAL,
+                _num_hazard_max(t, i, k) * (1 - FREE[t, get_edge_idx(i, k)]))
+
+    # (7) advancing constraint
+    for t in range(N):
+        model.addConstr(A[t, t], GRB.EQUAL, 1)
+
+    # (8) Lower triangular constraints
+    for t in range(N):
+        for i in range(N):
+            if i >= t and i not in param_np:
+                model.addConstr(B[t, i], GRB.EQUAL, 0)
+            if i >= t + 1:
+                model.addConstr(A[t, i], GRB.EQUAL, 0)
+
+    # (10) sum(S[i] == 1)
+    for i in range(N):
+        if s_len[i] > 1:
+            model.addConstr(quicksum(S[i]).item(), GRB.EQUAL, 1)
+
+    # (11) sum(E[i][j]) == 1
+    for idx in range(len(E_c)):
+        if not isinstance(E_c[idx], np.ndarray):
+            model.addConstr(quicksum(E_c[idx]).item(), GRB.EQUAL, 1)
+
+    for idx, (i, j) in enumerate(E):
+        if s_len[i] > 1:
+            for row in range(s_len[i]):
+                C = s_len[j]
+                model.addConstr(
+                    quicksum([E_c[idx][row * C + col]
+                              for col in range(C)]) <= S[i][row])
+        if s_len[j] > 1:
+            for col in range(s_len[j]):
+                R = s_len[i]
+                C = s_len[j]
+                model.addConstr(
+                    quicksum([E_c[idx][row * C + col]
+                              for row in range(R)]) <= S[j][col])
+
+    model.optimize()
+    s_val = np.full((N,), -1, dtype=np.int32)
+    for i in range(N):
+        if s_len[i] == 1:
+            s_val[i] = 0
+        else:
+            cur_s = [
+                model.getVarByName(f'S[{i}][{j}]').X for j in range(s_len[i])
+            ]
+            s_val[i] = get_non_zero_index(cur_s)
+
+    e_val = np.full((len(E),), -1, dtype=np.int32)
+    for (idx, (i, j)) in enumerate(E):
+        e_val[idx] = s_val[i] * s_len[j] + s_val[j]
+
+        tmp = []
+        if s_len[i] > 1 and s_len[j] > 1:
+            for k in range(s_len[i] * s_len[j]):
+                tmp.append(model.getVarByName(f'E[{i}][{j}][{k}]').X)
+            assert e_val[idx] == get_non_zero_index(tmp)
+
+    peak_mem = 0
+    peak_t = -1
+    for t in range(N):
+        for k in range(N):
+            cur_mem = model.getVarByName(f'U[{t},{k}]').X
+            if cur_mem > peak_mem:
+                peak_mem = cur_mem
+                peak_t = (t, k)
+
+    print("====================================")
+    print(f"Objective: {model.ObjVal}")
+    print(f"Peak memory: {peak_mem / GB} GB")
+    print(f"Peak time: {peak_t}")
+    print("====================================")
+
+    return None
 
 
 # Auto-sharded pipeline stages.
