@@ -38,7 +38,7 @@ alpa.util.disable_tqdm_globally()
 # Alpa uses a distributed framework `ray <https://docs.ray.io/>`_ to manage
 # the cluster and disributed workers. We initialize ray and alpa.
 
-ray.init()
+ray.init(_temp_dir="/rscratch/zhendong/lily/tmp/")
 alpa.init(cluster="ray")
 
 # Alternatively, you can use the following command to connect to an existing

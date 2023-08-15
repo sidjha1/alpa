@@ -337,7 +337,7 @@ def run_auto_sharding_pass(
 
             # Debug options
             "auto_sharding::simplify_graph":
-                False,
+                True,
             "auto_sharding::print_strategy":
                 os.environ.get("ALPA_DEBUG_PRINT_AS_STRATEGY", "False").lower()
                 in ["true", "1"],
@@ -926,7 +926,7 @@ def _call_solver_serialized_args(N,
     print(f"Peak time: {peak_t}")
     print("====================================")
 
-    return None
+    return s_val, e_val, objective, status
 
 
 def _call_solver_kiwi(N,

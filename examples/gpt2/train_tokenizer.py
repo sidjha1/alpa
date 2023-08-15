@@ -2,7 +2,12 @@ from datasets import load_dataset
 from tokenizers import trainers, Tokenizer, normalizers, ByteLevelBPETokenizer
 
 # load dataset
-dataset = load_dataset("oscar", "unshuffled_deduplicated_no", split="train")
+dataset = load_dataset(
+    "oscar",
+    "unshuffled_deduplicated_no",
+    split="train",
+    cache_dir="/rscratch/zhendong/lily/kiwi/.cache/huggingface"
+)
 
 # Instantiate tokenizer
 tokenizer = ByteLevelBPETokenizer()
