@@ -640,7 +640,7 @@ def cluster_layers_and_slice_mesh(
                                        submesh_choices,
                                        num_autosharding_configs, compute_cost)
         else:
-            _, solution = training_dp(num_layers, virtual_mesh.num_devices,
+            best_cost, solution = training_dp(num_layers, virtual_mesh.num_devices,
                                       num_micro_batches, submesh_choices,
                                       num_autosharding_configs, compute_cost,
                                       max_n_succ_stages)
@@ -667,10 +667,13 @@ def cluster_layers_and_slice_mesh(
         ]
 
         # Print and store the results
+        print("Best DP Cost: ", best_cost)
         print("Result forward_stage_layer_ids:", forward_stage_layer_ids)
         print("Result mesh_shapes:", submesh_shapes)
         print("Result logical_mesh_shapes:", logical_mesh_shapes)
         print("Result autosharding_option_dicts:", autosharding_option_dicts)
+        print("Solution", solution)
+        exit(0)
         global last_forward_stage_layer_ids, last_submesh_shapes
         global last_logical_mesh_shapes, last_autosharding_option_dicts
         last_forward_stage_layer_ids = forward_stage_layer_ids

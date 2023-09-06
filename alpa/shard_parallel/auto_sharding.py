@@ -337,7 +337,7 @@ def run_auto_sharding_pass(
 
             # Debug options
             "auto_sharding::simplify_graph":
-                True,
+                False,
             "auto_sharding::print_strategy":
                 os.environ.get("ALPA_DEBUG_PRINT_AS_STRATEGY", "False").lower()
                 in ["true", "1"],
@@ -361,7 +361,8 @@ def run_auto_sharding_pass(
 
     stage_plan = StagePlan(build_random_seed, logical_mesh.shape,
                            all_gather_threshold, as_option.all_reduce_threshold,
-                           as_option, last_s_val, last_objective)
+                           as_option, last_s_val, last_objective,
+                           last_mem_stage, last_mem_act)
 
     if return_mode == "single":
         return hlo, stage_plan
@@ -619,6 +620,8 @@ last_s_val = None
 # The last objective value of the best ILP solution.
 last_objective = None
 
+last_mem_stage = None
+last_mem_act = None
 
 # pylint: disable=import-outside-toplevel
 def _call_solver_serialized_args(N,
@@ -638,7 +641,7 @@ def _call_solver_serialized_args(N,
                                  s_init_np=None):
     """Call the solver with serialized arguments."""
     # pylint: disable=invalid-name
-    global last_s_val, last_objective
+    global last_s_val, last_objective, last_mem_stage, last_mem_act
 
     import pulp
     from pulp import LpVariable, LpProblem, LpMinimize, lpSum, lpDot, LpStatus
@@ -742,7 +745,6 @@ def _call_solver_serialized_args(N,
         return liveness_dict
 
     L = liveness_analysis(N)
-    M = 100 * GB
     print(f"Given memory: {M / GB} GB")
     print(f"Number of edges: {len(E)}")
     print(f"Number of nodes: {N}")
@@ -920,9 +922,19 @@ def _call_solver_serialized_args(N,
             peak_mem = mem
             peak_t = t
 
+    mem_stage = 0
+    for k in param_np:
+        mem_stage += m[k][s_val[k]]
+    mem_act = peak_mem - mem_stage
+
+    last_mem_stage = mem_stage
+    last_mem_act = mem_act
+
     print("====================================")
     print(f"Objective: {objective}")
     print(f"Peak memory: {peak_mem / GB} GB")
+    print(f"mem_stage: {mem_stage / GB} GB")
+    print(f"mem_act: {mem_act / GB} GB")
     print(f"Peak time: {peak_t}")
     print("====================================")
 
@@ -944,7 +956,7 @@ def _call_solver_kiwi(N,
                       elementwise_np,
                       param_np,
                       s_init_np=None):
-    global last_s_val, last_objective
+    global last_s_val, last_objective, last_mem_stage, last_mem_act
 
     for x in [s_len_np, E_np, A_np, L_np, c_np, d_np, m_np, r_np, v_np]:
         assert isinstance(x, np.ndarray)
@@ -969,11 +981,11 @@ def _call_solver_kiwi(N,
     assert pt == len(r_np)
 
     A = A_np.reshape((-1, 2))  # noqa
-    v = []
+    v_alias = []
     pt = 0
     for (i, j) in A:
         prod_length = s_len[i] * s_len[j]
-        v.append(v_np[pt:pt + prod_length])
+        v_alias.append(v_np[pt:pt + prod_length])
         pt += prod_length
     assert pt == len(v_np)
 
@@ -1041,8 +1053,12 @@ def _call_solver_kiwi(N,
 
     def get_non_zero_index(bv):
         for j, ele in enumerate(bv):
-            if abs(ele - 1) < 0.001:
-                return j
+            try:
+                if abs(ele.X - 1) < 0.001:
+                    return j
+            except:
+                if abs(ele - 1) < 0.001:
+                    return j
         assert False
 
     def liveness_analysis(sep_id):
@@ -1142,6 +1158,7 @@ def _call_solver_kiwi(N,
 
     sep_id = get_sep_id()
     print(f"sep_id: {sep_id}")
+    print(param_np)
 
     model = gp.Model("kiwi")
     model.Params.TimeLimit = 1000
@@ -1323,8 +1340,8 @@ def _call_solver_kiwi(N,
 
         for row in range(s_len[i]):
             for col in range(s_len[j]):
-                if v[idx][row * C + col] > 0.5:
-                    prob += S[i][row] + S[j][col] <= 1
+                if v_alias[idx][row * C + col] > 0.5:
+                    model.addConstr(S[i][row] + S[j][col] <= 1)
 
     # Force no recompute
     # if True:
@@ -1333,6 +1350,19 @@ def _call_solver_kiwi(N,
 
     model.optimize()
 
+    # Get and check results
+    s_val = np.full((N,), -1, dtype=np.int32)
+    for i in range(N):
+        s_val[i] = get_non_zero_index(S[i])
+
+    e_val = np.full((len(E),), -1, dtype=np.int32)
+    for (idx, (i, j)) in enumerate(E):
+        e_val[idx] = get_non_zero_index(E_c[idx])
+        i_spec_index = e_val[idx] // s_len[j]
+        j_spec_index = e_val[idx] % s_len[j]
+        assert i_spec_index == s_val[i], f"e_val[{i}][{j}]"
+        assert j_spec_index == s_val[j], f"e_val[{i}][{j}]"
+
     peak_mem = 0
     for k in range(N):
         cur_mem = model.getVarByName(f'U[0,{k}]').X
@@ -1340,9 +1370,21 @@ def _call_solver_kiwi(N,
             peak_mem = cur_mem
             peak_t = (k)
 
+    mem_stage = 0
+    for k in param_np:
+        mem_stage += m[k][s_val[k]]
+    mem_act = peak_mem - mem_stage
+
+    last_objective = model.ObjVal
+    last_s_val = s_val
+    last_mem_stage = mem_stage
+    last_mem_act = mem_act
+
     print("====================================")
     print(f"Objective: {model.ObjVal}")
     print(f"Peak memory: {peak_mem / GB} GB")
+    print(f"mem_stage: {mem_stage / GB} GB")
+    print(f"mem_act: {mem_act / GB} GB")
     print(f"Peak time: {peak_t}")
     print("====================================")
 
@@ -1352,7 +1394,7 @@ def _call_solver_kiwi(N,
             recomputed.append(i)
 
     print(f"Recomputed: {recomputed}")
-    return None
+    return s_val, e_val, model.ObjVal, None
 
 
 def _call_solver_optimal(N,
@@ -1426,7 +1468,7 @@ def _call_solver_optimal(N,
     assert pt == len(d_np), f"{pt} == {len(d_np)}"
     assert pt == len(m_np), f"{pt} == {len(m_np)}"
 
-    M = 100 * GB
+    M = 1000 * GB
     print("PEAK MEM: ", M)
 
     def get_parent(i):

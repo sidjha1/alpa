@@ -113,6 +113,9 @@ class StageProfileResult:
         self.available_memory = None
         self.initial_var_names = tuple(initial_var_names)
         self.initial_var_sizes = tuple(initial_var_sizes)
+        self.auto_sharding_compute_cost = -1
+        self.auto_sharding_mem_stage = -1
+        self.auto_sharding_mem_act = -1
 
     def fully_profiled(self):
         return all(r is not None for r in self.module_profile_results)
@@ -451,7 +454,6 @@ class HloCostModelProfileWorker:
 
         return stage_id, cost, peak_memory, available_memory
 
-
 class HloCostModelProfileWorkerPool(BaseWorkerPoolWrapper):
     """A pool of HloCostModelProfileWorker for distributed profiling.
 
@@ -584,64 +586,97 @@ def profile_all(stages, compiled_outputs: Sequence[CompileOutput], meshes,
     """
     placement_group = retrieve_placement_group()
 
-    if auto_stage_option.use_hlo_cost_model:
-        num_cpus = int(
-            min(max(ray.available_resources()["CPU"] // 2, 1), len(stages)))
-        mesh_num_devices = meshes[0].num_devices
-        prof_database = ProfilingResultDatabase()
-        prof_database.load(auto_stage_option.profiling_database_filename)
-        prof_result = prof_database.query("default", meshes[0].shape)
-        profile_workers = HloCostModelProfileWorkerPool(num_cpus,
-                                                        placement_group,
-                                                        prof_result,
-                                                        mesh_num_devices,
-                                                        num_micro_batches)
-    else:
-        profile_workers = ProfileWorkerPool(meshes, placement_group)
-
-    successful_compile_ct = 0
-    for i, (compiled_output, stage) in enumerate(zip(compiled_outputs, stages)):
-        if compiled_output is None:
-            continue
-        stage_idx, stage_config, _ = stage
-
-        for module_id, (acc_grad_module, profile_config) in enumerate(
-                zip(compiled_output.acc_grad_module_compile_outputs,
-                    stage_config.module_profile_configs)):
-            if profile_results[stage_idx].is_module_profiled(module_id):
+    print(f"[Kiwi] {len(stages)}, {len(compiled_outputs)}")
+    use_ilp_cost = True
+    if use_ilp_cost:
+        for (compile_output, stage) in zip(compiled_outputs, stages):
+            stage_idx, stage_config, _ = stage
+            if compile_output.stage_plan.auto_sharding_objective == None:
+                # sid: Not sure why the fields in stage_plan are None. In this case
+                # I set the profile result to have values such that the plan is never chosen.
+                profile_results[stage_idx].auto_sharding_compute_cost = 10**20
+                profile_results[stage_idx].auto_sharding_mem_stage = 10**20
+                profile_results[stage_idx].auto_sharding_mem_act = 10**20
                 continue
-            profile_workers.submit(lambda w, v: w.profile.remote(*v),
-                                   ((i, module_id), acc_grad_module,
-                                    compiled_output.stage_plan, profile_config))
-            successful_compile_ct += 1
 
-    pbar = tqdm.tqdm(range(successful_compile_ct))
-    for _ in pbar:
-        try:
-            ((i, module_id),
-             *module_raw_result) = profile_workers.get_next_unordered()
-        except TimeoutError:
-            profile_workers.shutdown(force=True)
-            logger.warning("After waiting for too long, "
-                           "all profile workers are forcely killed")
-            return profile_results
-        except (RuntimeError, RayActorError):
-            profile_workers.shutdown(force=True)
-            logger.warning("Meet unexpected error, "
-                           "all profile workers are forcely killed")
-            return profile_results
-        stage_idx, stage_config, _ = stages[i]
-        stage_compile_output = compiled_outputs[i]
-        module_profile_result = generate_module_profile_result(
-            module_raw_result, stage_config.module_profile_configs[module_id],
-            stage_compile_output.acc_grad_module_compile_outputs[module_id],
-            stage_compile_output.stage_plan.logical_mesh_shape)
-        pbar.write(f"result[{stage_idx}, {module_id}] "
-                   f"= {module_profile_result}")
-        profile_results[stage_idx].add_module_profile_result(
-            module_id, module_profile_result)
-    profile_workers.shutdown()
-    return profile_results
+            assert profile_results[stage_idx].auto_sharding_compute_cost == -1
+            profile_results[stage_idx].auto_sharding_compute_cost = \
+                compile_output.stage_plan.auto_sharding_objective
+            profile_results[stage_idx].auto_sharding_mem_stage = \
+                compile_output.stage_plan.auto_sharding_mem_stage
+            profile_results[stage_idx].auto_sharding_mem_act = \
+                compile_output.stage_plan.auto_sharding_mem_act
+        return profile_results
+    else:
+        if auto_stage_option.use_hlo_cost_model:
+            num_cpus = int(
+                min(max(ray.available_resources()["CPU"] // 2, 1), len(stages)))
+            mesh_num_devices = meshes[0].num_devices
+            prof_database = ProfilingResultDatabase()
+            prof_database.load(auto_stage_option.profiling_database_filename)
+            prof_result = prof_database.query("default", meshes[0].shape)
+            profile_workers = HloCostModelProfileWorkerPool(num_cpus,
+                                                            placement_group,
+                                                            prof_result,
+                                                            mesh_num_devices,
+                                                            num_micro_batches)
+        else:
+            profile_workers = ProfileWorkerPool(meshes, placement_group)
+
+        successful_compile_ct = 0
+        for i, (compiled_output, stage) in enumerate(zip(compiled_outputs, stages)):
+            if compiled_output is None:
+                continue
+            stage_idx, stage_config, _ = stage
+
+            for module_id, (acc_grad_module, profile_config) in enumerate(
+                    zip(compiled_output.acc_grad_module_compile_outputs,
+                        stage_config.module_profile_configs)):
+                if profile_results[stage_idx].is_module_profiled(module_id):
+                    continue
+                profile_workers.submit(lambda w, v: w.profile.remote(*v),
+                                    ((i, module_id), acc_grad_module,
+                                        compiled_output.stage_plan, profile_config))
+                successful_compile_ct += 1
+
+        pbar = tqdm.tqdm(range(successful_compile_ct))
+        for _ in pbar:
+            try:
+                ((i, module_id),
+                *module_raw_result) = profile_workers.get_next_unordered()
+            except TimeoutError:
+                profile_workers.shutdown(force=True)
+                logger.warning("After waiting for too long, "
+                            "all profile workers are forcely killed")
+                return profile_results
+            except (RuntimeError, RayActorError):
+                profile_workers.shutdown(force=True)
+                logger.warning("Meet unexpected error, "
+                            "all profile workers are forcely killed")
+                return profile_results
+            stage_idx, stage_config, _ = stages[i]
+            stage_compile_output = compiled_outputs[i]
+            module_profile_result = generate_module_profile_result(
+                module_raw_result, stage_config.module_profile_configs[module_id],
+                stage_compile_output.acc_grad_module_compile_outputs[module_id],
+                stage_compile_output.stage_plan.logical_mesh_shape)
+            pbar.write(f"result[{stage_idx}, {module_id}] "
+                    f"= {module_profile_result}")
+            profile_results[stage_idx].add_module_profile_result(
+                module_id, module_profile_result)
+
+        for (compile_output, stage) in zip(compiled_outputs, stages):
+            stage_idx, stage_config, _ = stage
+            assert profile_results[stage_idx].auto_sharding_compute_cost == -1
+            profile_results[stage_idx].auto_sharding_compute_cost = \
+                compile_output.stage_plan.auto_sharding_objective
+            profile_results[stage_idx].auto_sharding_mem_stage = \
+                compile_output.stage_plan.auto_sharding_mem_stage
+            profile_results[stage_idx].auto_sharding_mem_act = \
+                compile_output.stage_plan.auto_sharding_mem_act
+
+        profile_workers.shutdown()
+        return profile_results
 
 
 def generate_training_stages_2d(layers,
@@ -756,6 +791,20 @@ def generate_inference_stages_2d(layers,
 def get_merged_stages_memory_stats(
         profile_results: Sequence[StageProfileResult],
         inference_mode: bool = False):
+    if True:
+        initial_size = profile_results[0].auto_sharding_mem_stage
+        intermediate_size = profile_results[0].auto_sharding_mem_act
+        peak_memory = initial_size + intermediate_size
+        available_memory = 24 * 2**30
+
+        max_stage = int((available_memory - peak_memory - initial_size) //
+                        max(intermediate_size, 1e-8) - 1)
+        max_stage = min(max(-1, max_stage), INFINITY_N_STAGES)
+        print(profile_results[0].auto_sharding_compute_cost, max_stage)
+
+        return (available_memory, peak_memory, initial_size, intermediate_size,
+            max_stage)
+
     initial_var_sizes_dict = {}
     for stage_result in profile_results:
         for name, size in zip(stage_result.initial_var_names,
@@ -932,9 +981,10 @@ def interpret_profile_result_training_2d(
         if index not in profile_results:
             continue
         profile_result = profile_results[index]
-        all_compute_cost[index] = sum(
-            result.compute_cost
-            for result in profile_result.module_profile_results)
+        # all_compute_cost[index] = sum(
+        #     result.compute_cost
+        #     for result in profile_result.module_profile_results)
+        all_compute_cost[index] = profile_result.auto_sharding_compute_cost
         _, _, _, _, all_max_n_succ_stages[index] = (
             get_merged_stages_memory_stats([profile_result]))
 
@@ -1122,9 +1172,14 @@ def distributed_profile_on_mesh(stages, meshes: Sequence[VirtualPhysicalMesh],
     # shape of compute_cost and max_n_succ_stages:
     # (num_layers, num_layers, num_autosharding_configs)
     timers("stage-construction-profiling").start()
+    print(f"[Kiwi] {len(stages)}, {len(profile_results)}, {len(meshes)}")
     profile_results = profile_all(stages, compiled_outputs, meshes,
                                   num_micro_batches, auto_stage_option,
                                   profile_results)
+    print(f"[Kiwi] {len(profile_results)}")
+    for key, val in profile_results.items():
+        print(key, val.auto_sharding_compute_cost)
+
     timers("stage-construction-profiling").stop()
     return profile_results
 

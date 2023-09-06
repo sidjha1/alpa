@@ -5,7 +5,7 @@ import jax
 import ray
 
 
-batch_size = 128
+batch_size = 64
 seq_len = 1024
 hidden_dim = 5120
 num_layers = 4

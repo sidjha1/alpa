@@ -28,6 +28,8 @@ class StagePlan:
     auto_sharding_option: "AutoShardingOption"
     auto_sharding_solution_vector: np.ndarray
     auto_sharding_objective: int
+    auto_sharding_mem_stage: int
+    auto_sharding_mem_act: int
 
 
 @dataclass
