@@ -2,12 +2,13 @@ import alpa
 
 import jax.numpy as jnp
 import jax
+import ray
 
 
-batch_size = 16
+batch_size = 128
 seq_len = 1024
 hidden_dim = 5120
-num_layers = 1
+num_layers = 4
 heads = 40
 
 main_rng = jax.random.PRNGKey(42)
@@ -44,7 +45,14 @@ for _ in range(num_layers):
     params['W2'].append(W2)
     params['head_proj'].append(head_proj)
 
-@alpa.parallelize
+ray.init(_temp_dir="/rscratch/zhendong/lily/tmp/")
+alpa.init(cluster="ray")
+
+method = alpa.PipeshardParallel(num_micro_batches=16,
+                                layer_option=alpa.AutoLayerOption(layer_num=2),
+                                stage_option="auto")
+
+@alpa.parallelize(method=method)
 def alpa_train_step(parameters, batch):
     def loss_func(params, batch):
         input = batch['x']
@@ -58,11 +66,11 @@ def alpa_train_step(parameters, batch):
 
             # (batch_size, seq_len, heads, hidden_dim / heads)
             Q = jnp.reshape(
-                Q, (batch_size, seq_len, heads, int(hidden_dim / heads)))
+                Q, (input.shape[0], seq_len, heads, int(hidden_dim / heads)))
             K = jnp.reshape(
-                K, (batch_size, seq_len, heads, int(hidden_dim / heads)))
+                K, (input.shape[0], seq_len, heads, int(hidden_dim / heads)))
             V = jnp.reshape(
-                V, (batch_size, seq_len, heads, int(hidden_dim / heads)))
+                V, (input.shape[0], seq_len, heads, int(hidden_dim / heads)))
 
             # (batch_size, heads, seq_len, hidden_dim / heads)
             Q = jnp.transpose(Q, axes=(0, 2, 1, 3))
@@ -89,7 +97,7 @@ def alpa_train_step(parameters, batch):
 
             # (batch_size, seq_len, hidden_dim)
             attention_output = jnp.reshape(
-                attention_output, (batch_size, seq_len, hidden_dim))
+                attention_output, (input.shape[0], seq_len, hidden_dim))
             attention_output = jnp.matmul(
                 attention_output, params['head_proj'][i])
 
@@ -116,7 +124,7 @@ def alpa_train_step(parameters, batch):
         loss = jnp.linalg.norm(layer_norm_output - batch['y'])**2
         return loss
 
-    grads = jax.grad(loss_func)(parameters, batch)
+    grads = alpa.grad(loss_func)(parameters, batch)
     for key in grads:
         for i in range(num_layers):
             parameters[key][i] = parameters[key][i] - \
